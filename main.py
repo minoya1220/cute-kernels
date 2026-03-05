@@ -23,6 +23,28 @@ def vector_add_kernel_noob(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
 
     gC[mi, ni] = gA[mi, ni] + gB[mi, ni] # load from global -> add -> write to global
 
+@cute.kernel
+def vector_add_kernel_pro(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    bdim, _, _ = cute.arch.block_dim()
+
+    tid = bidx * bdim + tidx # global tid
+
+    m, n = gA.shape[1] # gA has been zip divided so
+    mi = tid // n
+    ni = tid % n
+
+    # doing None on a dim grabs everything, .load() moves into registers
+    rA = gA[(None, (mi, ni))].load()
+    rB = gB[(None, (mi, ni))].load()
+    # prints at compile time
+    print(f"[DSL INFO] sliced gA = {gA[(None, (mi, ni))]}")
+    print(f"[DSL INFO] sliced gA = {gB[(None, (mi, ni))]}")
+
+    gC[(None, (mi, ni))] = rA + rB
+
+
 @cute.jit
 def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     # not sure what the m in mA and mB refers to, could be for "matrix" essentially represents raw input tensor
@@ -31,31 +53,56 @@ def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
 
     m, n = mA.shape
 
-    noob_kernel = vector_add_kernel_noob(mA, mB, mC)
+    # # ------ NOOB -------
+    # noob_kernel = vector_add_kernel_noob(mA, mB, mC)
 
-    noob_kernel.launch(
-        grid=((m*n + block_size - 1) // block_size, 1, 1),
-        block=(block_size, 1, 1)
-    )
+    # noob_kernel.launch(
+    #     grid=((m*n + block_size - 1) // block_size, 1, 1),
+    #     block=(block_size, 1, 1)
+    # )
+    # # -------------------
+
+    # ------ PRO --------
+    
+    # -------------------
 
 M, N = 16384, 8192
 
-A = torch.zeros(M,N, device='cuda', dtype=toch.bfloat16)
-B = torch.zeros(M,N, device='cuda', dtype=toch.bfloat16)
-C = torch.zeros(M,N, device='cuda', dtype=toch.bfloat16)
+A = torch.randn(M,N, device='cuda', dtype=torch.bfloat16)
+B = torch.randn(M,N, device='cuda', dtype=torch.bfloat16)
+C = torch.randn(M,N, device='cuda', dtype=torch.bfloat16)
 
 total_elem = M * N * 3
 
 # converts torch tensors to CuTe tensors
-a_ = from_dlpack(a, assumed_align=16)
-b_ = from_dlpack(b, assumed_align=16)
-c_ = from_dlpack(c, assumed_align=16)
+a_ = from_dlpack(A, assumed_align=16)
+b_ = from_dlpack(B, assumed_align=16)
+c_ = from_dlpack(C, assumed_align=16)
 
 vector_add_ = cute.compile(vector_add, a_, b_, c_)
 
 vector_add_(a_, b_, c_)
+
+torch.testing.assert_close(C, A + B)
 print("test run successful")
 
+def benchmark(func: callable, a_: cute.Tensor, b_ : cute.Tensor, c_: cute.Tensor):
+    # cute dsl has built-in benchmarking tooling
+    # output is time in µs
+    avg_time = cute.testing.benchmark(
+        func,
+        kernel_arguments=cute.testing.JitArguments(a_, b_, c_),
+        warmup_iterations=5,
+        iterations=100,
+    )
+    
+    
+    total_size = total_elem * 2 # 2 bytes per element
+    bandwidth_usage = total_size / (avg_time) / 1000 # div by 10^3 to convert from MB/s to GB/s
+    print(f"Average time: {avg_time} µs")
+    print(f"Bandwidth Usage: {bandwidth_usage} GB/s")
+
+benchmark(vector_add_, a_, b_, c_)
 
 
 
