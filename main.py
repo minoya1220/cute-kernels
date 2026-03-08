@@ -44,16 +44,48 @@ def vector_add_kernel_pro(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
 
     gC[(None, (mi, ni))] = rA + rB
 
+@cute.kernel
+def vector_add_kernel_hacker(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, tv_layout: cute.Layout):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    blk_coord = ((None, None), bidx)
+
+    # logical coord -> address
+    blkA = gA[blk_coord] # (TileM, TileN) -> physical address
+    blkB = gB[blk_coord] 
+    blkC = gC[blk_coord] 
+
+    tidfrgA = cute.composition(blkA, tv_layout)
+    tidfrgB = cute.composition(blkB, tv_layout)
+    tidfrgC = cute.composition(blkC, tv_layout)
+
+    print(f"[DSL INFO] Composed with TV layout: {tidfrgA}")
+
+    thr_coord = (tidx, None)
+
+    thrA = tidfrgA[thr_coord]
+    thrB = tidfrgB[thr_coord]
+    thrC = tidfrgC[thr_coord]
+    
+    thrC[None] = thrA.load() + thrB.load()
+
+
+@cute.kernel
+def vector_add_kernel_god(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, tv_layout: cute.Layout):
+    pass
+
 
 @cute.jit
 def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
-    # not sure what the m in mA and mB refers to, could be for "matrix" essentially represents raw input tensor
+    # not sure what the m in mA and mB refers to, could be for "matrix" but it essentially represents raw input tensor
     
-    block_size = 256
 
     m, n = mA.shape
 
     # # ------ NOOB -------
+    # block_size = 256
+
     # noob_kernel = vector_add_kernel_noob(mA, mB, mC)
 
     # noob_kernel.launch(
@@ -63,10 +95,33 @@ def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     # # -------------------
 
     # ------ PRO --------
-    
+    block_size = 256
+
+    gA = cute.zipped_divide(mA, tiler=(1,8)) # creating 1x4 tiles across our whole tensor for vectorization
+    gB = cute.zipped_divide(mB, tiler=(1,8)) # requires N dimension to be divisible by 4
+    gC = cute.zipped_divide(mC, tiler=(1,8)) 
+
+    print(f"[DSL INFO] gA = {gA}")
+    print(f"[DSL INFO] gB = {gB}")
+    print(f"[DSL INFO] gC = {gC}")
+
+    pro_kernel = vector_add_kernel_pro(gA, gB, gC)
+
+    pro_kernel.launch( # divide N by 4 now that each thread is responsible for 4 elements
+        grid=((m * (n // 8) + block_size - 1) // block_size, 1, 1),
+        block=(block_size, 1, 1)
+    )
     # -------------------
 
-M, N = 16384, 8192
+    # ----- HACKER ------
+
+    # -------------------
+
+    # ------ GOD --------
+
+    # -------------------
+
+M, N = 1024, 1024
 
 A = torch.randn(M,N, device='cuda', dtype=torch.bfloat16)
 B = torch.randn(M,N, device='cuda', dtype=torch.bfloat16)
