@@ -114,7 +114,28 @@ def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     # -------------------
 
     # ----- HACKER ------
+    # coalesced_bytes = 16 # 128 bits in a vector load
+    # num_rows_per_thread = 16
 
+    # assert all(mA.element_type == t.element_type for t in [mA, mB, mC])
+    # dtype = mA.element_type
+
+    # thr_layout = cute.make_ordered_layout((4, 64), order=(1,0))
+    # val_layout = cute.make_ordered_layout((num_rows_per_thread, coalesced_bytes), order=(1, 0))
+    # val_layout = cute.recast_layout(dtype.width, 8, val_layout) 
+    # # first output is the element-wise product of the two layouts, it define the shape of a single block
+    # tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout) 
+    # print(f"[DSL INFO] tiler_mn: {tiler_mn}") # tiler mn
+    # print(f"[DSL INFO] TV layout: {tv_layout} ")
+
+    # gA = cute.zipped_divide(mA, tiler=tiler_mn)
+    # gB = cute.zipped_divide(mB, tiler=tiler_mn)
+    # gC = cute.zipped_divide(mC, tiler=tiler_mn) 
+
+    # vector_add_kernel_hacker(gA, gB, gC, tv_layout).launch(
+    #     grid=[cute.size(gC, mode=[1]), 1, 1],
+    #     block=[cute.size(tv_layout, mode=[0]), 1, 1]
+    # )
     # -------------------
 
     # ------ GOD --------
