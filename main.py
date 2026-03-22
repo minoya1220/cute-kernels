@@ -72,9 +72,49 @@ def vector_add_kernel_hacker(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, 
 
 
 @cute.kernel
-def vector_add_kernel_god(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, tv_layout: cute.Layout):
-    pass
+def vector_add_kernel_god(
+    op: cutlass.Constexpr, # any arbitrary binary op instead of just addition
+    cC: cute.Tensor, # coordinate tensor for guarding loads and stores
+    gInputs: List[cute.Tensor], # holds gA and gB
+    gC: cute.Tensor, 
+    tv_layout: cute.Layout,
+    shape: cute.Shape):
 
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    blk_coord = ((None, None), bidx) # used for grabbing just the portion of this thread block out ofo inputs and outputs
+
+    blkInputs = [t[blk_coord] for t in gInputs] # can use iterable to slice across multiple inputs
+    blkC = gC[blk_coord]
+    blkcC = cC[blk_coord]
+
+    frgInputs = [cute.composition(t, tv_layout) for t in blkInputs]
+    frgC = cute.composition(blkC, tv_layout)
+    frgcC = cute.composition(blkcC, tv_layout)
+
+    thr_crd = (tidx, cute.repeat_like(None, frgInputs[0].shape[1])) # cute.repeat_like will just copy over whatever value layout is there
+
+
+    thrInputs = [t[thr_crd] for t in frgInputs] # selects just the values for this thread
+    thrC = frgC[thr_crd]
+    thrcC = frgcC[thr_crd] # does the same selection in the coordinate tensor
+
+    rPred = cute.make_fragment(thrcC.shape, cutlass.Boolean) # actually allocates registers for the predicate
+    if cute.elem_less(thrCrd[cute.size(thrCrd) - 1], shape)""
+        result = op(*[t.load() for t in thrInputs]) # unpacks the input into arguments for op
+        thrC.store(result)
+    else:
+        # predicated path, non vectorized  ## comment this if statement if broken,
+        rInputs = []
+        for thrInput in thrInputs:
+            r = cute.make_fragment_like(thrInputs)
+            cute.fill(r, 0)
+            cute.copy(thrInput, r, frgPred)
+            rInputs.append(r)
+        cute.copy(op(*rInputs), thrC, frgPred)
+
+        # any element wise op with any number of inputs now works with this kernel it just need to be passed at compile time
 
 @cute.jit
 def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
@@ -181,34 +221,3 @@ def benchmark(func: callable, a_: cute.Tensor, b_ : cute.Tensor, c_: cute.Tensor
 benchmark(vector_add_, a_, b_, c_)
 
 
-
-# print("file launched")
-# import cutlass
-# import cutlass.cute as cute
-# print("imported")
-
-# @cute.kernel
-# def kernel():
-#     tid, _, _ = cute.arch.thread_idx()
-#     if tid == 0:
-#         cute.printf("dwadowjad")
-
-# @cute.jit
-# def kernel_launcher():
-#     cute.printf("launching kernel...")
-
-#     kernel().launch(
-#         grid=(1,1,1),
-#         block=(1,1,1)
-#     )
-# print("func deffed")
-
-# cutlass.cuda.initialize_cuda_context()
-# print("context")
-
-# print("running jit compiled")
-# kernel_launcher()
-
-# print("precompiled and objdump")
-# kernel_compiled = cute.compile(kernel_launcher, options="") # options: --keep-ptx --keep-cubin 
-# kernel_compiled()
