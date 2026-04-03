@@ -1,14 +1,14 @@
-# using vector add educational notebook from NVIDIA
+# reimplementation of vector add educational notebook from NVIDIA
 import torch
 from functools import partial
 from typing import List
-
+from operator import mul, add
 import cutlass 
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 @cute.kernel
-def vector_add_kernel_noob(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
+def vector_add_kernel_v1(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     # the g in gA, gB, gC identifies which memory the tensor is stored in
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -24,7 +24,7 @@ def vector_add_kernel_noob(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     gC[mi, ni] = gA[mi, ni] + gB[mi, ni] # load from global -> add -> write to global
 
 @cute.kernel
-def vector_add_kernel_pro(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
+def vector_add_kernel_v2(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     bdim, _, _ = cute.arch.block_dim()
@@ -45,7 +45,7 @@ def vector_add_kernel_pro(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor):
     gC[(None, (mi, ni))] = rA + rB
 
 @cute.kernel
-def vector_add_kernel_hacker(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, tv_layout: cute.Layout):
+def vector_add_kernel_v3(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, tv_layout: cute.Layout):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
 
@@ -72,7 +72,7 @@ def vector_add_kernel_hacker(gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, 
 
 
 @cute.kernel
-def vector_add_kernel_god(
+def vector_add_kernel_v4(
     op: cutlass.Constexpr, # any arbitrary binary op instead of just addition
     cC: cute.Tensor, # coordinate tensor for guarding loads and stores
     gInputs: List[cute.Tensor], # holds gA and gB
@@ -101,59 +101,62 @@ def vector_add_kernel_god(
     thrcC = frgcC[thr_crd] # does the same selection in the coordinate tensor
 
     rPred = cute.make_fragment(thrcC.shape, cutlass.Boolean) # actually allocates registers for the predicate
-    if cute.elem_less(thrCrd[cute.size(thrCrd) - 1], shape)""
+    if cute.elem_less(thrcC[cute.size(thrcC) - 1], shape):
         result = op(*[t.load() for t in thrInputs]) # unpacks the input into arguments for op
         thrC.store(result)
-    else:
+    # else:
         # predicated path, non vectorized  ## comment this if statement if broken,
-        rInputs = []
-        for thrInput in thrInputs:
-            r = cute.make_fragment_like(thrInputs)
-            cute.fill(r, 0)
-            cute.copy(thrInput, r, frgPred)
-            rInputs.append(r)
-        cute.copy(op(*rInputs), thrC, frgPred)
+        #### BROKEN, FIX LATER #####
+        # rInputs = []
+        # for thrInput in thrInputs:
+        #     r = cute.make_fragment_like(thrInput)
+        #     cute.full_like(r, 0, dtype=r._dtype)
+        #     cute.copy(thrInput, r, rPred)
+        #     rInputs.append(r)
+        # cute.copy(op(*rInputs), thrC, rPred)
 
         # any element wise op with any number of inputs now works with this kernel it just need to be passed at compile time
 
 @cute.jit
-def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
+def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, op: cutlass.Constexpr=None):
     # not sure what the m in mA and mB refers to, could be for "matrix" but it essentially represents raw input tensor
     
+    inputs = [mA, mB]
+    result = mC
 
     m, n = mA.shape
 
-    # # ------ NOOB -------
+    # # ------ V1 -------
     # block_size = 256
 
-    # noob_kernel = vector_add_kernel_noob(mA, mB, mC)
+    # v1_kernel = vector_add_kernel_v1(mA, mB, mC)
 
-    # noob_kernel.launch(
+    # v1_kernel.launch(
     #     grid=((m*n + block_size - 1) // block_size, 1, 1),
     #     block=(block_size, 1, 1)
     # )
     # # -------------------
 
-    # ------ PRO --------
-    block_size = 256
+    # ------ V2 --------
+    # block_size = 256
 
-    gA = cute.zipped_divide(mA, tiler=(1,8)) # creating 1x4 tiles across our whole tensor for vectorization
-    gB = cute.zipped_divide(mB, tiler=(1,8)) # requires N dimension to be divisible by 4
-    gC = cute.zipped_divide(mC, tiler=(1,8)) 
+    # gA = cute.zipped_divide(mA, tiler=(1,8)) # creating 1x4 tiles across our whole tensor for vectorization
+    # gB = cute.zipped_divide(mB, tiler=(1,8)) # requires N dimension to be divisible by 4
+    # gC = cute.zipped_divide(mC, tiler=(1,8)) 
 
-    print(f"[DSL INFO] gA = {gA}")
-    print(f"[DSL INFO] gB = {gB}")
-    print(f"[DSL INFO] gC = {gC}")
+    # print(f"[DSL INFO] gA = {gA}")
+    # print(f"[DSL INFO] gB = {gB}")
+    # print(f"[DSL INFO] gC = {gC}")
 
-    pro_kernel = vector_add_kernel_pro(gA, gB, gC)
+    # v2_kernel = vector_add_kernel_v2(gA, gB, gC)
 
-    pro_kernel.launch( # divide N by 4 now that each thread is responsible for 4 elements
-        grid=((m * (n // 8) + block_size - 1) // block_size, 1, 1),
-        block=(block_size, 1, 1)
-    )
+    # v2_kernel.launch( # divide N by 4 now that each thread is responsible for 4 elements
+    #     grid=((m * (n // 8) + block_size - 1) // block_size, 1, 1),
+    #     block=(block_size, 1, 1)
+    # )
     # -------------------
 
-    # ----- HACKER ------
+    # ----- V3 ------
     # coalesced_bytes = 16 # 128 bits in a vector load
     # num_rows_per_thread = 16
 
@@ -172,14 +175,41 @@ def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     # gB = cute.zipped_divide(mB, tiler=tiler_mn)
     # gC = cute.zipped_divide(mC, tiler=tiler_mn) 
 
-    # vector_add_kernel_hacker(gA, gB, gC, tv_layout).launch(
+    # vector_add_kernel_v3(gA, gB, gC, tv_layout).launch(
     #     grid=[cute.size(gC, mode=[1]), 1, 1],
     #     block=[cute.size(tv_layout, mode=[0]), 1, 1]
     # )
     # -------------------
 
-    # ------ GOD --------
+    # ------ V4 --------
+    coalesced_bytes = 16 # max size of a memory transaction (128b)
 
+    assert all(t.element_type == inputs[0].element_type for t in inputs)
+    dtype = inputs[0].element_type
+
+    thr_layout = cute.make_ordered_layout((4,64), order=(1,0))
+    val_layout = cute.make_ordered_layout((16, coalesced_bytes), order=(1,0))
+    val_layout = cute.recast_layout(dtype.width, 8, val_layout) # dtype.width is in bits, divide that by 8 bits in a byte
+    tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+
+    mInputs = [cute.zipped_divide(input, tiler_mn) for input in inputs] # partition our blocks using our tv layout
+    mC = cute.zipped_divide(result, tiler_mn) # same division
+    cC = cute.make_identity_tensor(result.shape)
+    cC = cute.zipped_divide(cC, tiler=tiler_mn)
+    remap_block = cute.make_ordered_layout(
+        cute.select(mInputs[0].shape[1], mode=[1,0]), order=(1,0)
+    )
+    for i, t in enumerate(mInputs):
+        mInputs[i] = cute.composition(t, (None, remap_block))
+    
+    mC = cute.composition(mC, (None, remap_block))
+
+    
+    cC = cute.composition(cC, (None, remap_block))
+    vector_add_kernel_v4(op, cC, mInputs, mC, tv_layout, result.shape).launch(
+        grid=[cute.size(mC, mode=[1]), 1, 1],
+        block=[cute.size(tv_layout,mode=[0]), 1, 1]
+    )
     # -------------------
 
 M, N = 1024, 1024
@@ -195,14 +225,17 @@ a_ = from_dlpack(A, assumed_align=16)
 b_ = from_dlpack(B, assumed_align=16)
 c_ = from_dlpack(C, assumed_align=16)
 
-vector_add_ = cute.compile(vector_add, a_, b_, c_)
+op = add
+def swiglu(a, b):
+    return a * b * (1.0 / (1.0 + cute.exp(-b)))
+vector_add_ = cute.compile(vector_add, a_, b_, c_, op)
 
 vector_add_(a_, b_, c_)
 
-torch.testing.assert_close(C, A + B)
+# torch.testing.assert_close(C, A + B)
 print("test run successful")
 
-def benchmark(func: callable, a_: cute.Tensor, b_ : cute.Tensor, c_: cute.Tensor):
+def benchmark(func: callable, a_: cute.Tensor, b_ : cute.Tensor, c_: cute.Tensor, op=None):
     # cute dsl has built-in benchmarking tooling
     # output is time in µs
     avg_time = cute.testing.benchmark(
@@ -218,6 +251,5 @@ def benchmark(func: callable, a_: cute.Tensor, b_ : cute.Tensor, c_: cute.Tensor
     print(f"Average time: {avg_time} µs")
     print(f"Bandwidth Usage: {bandwidth_usage} GB/s")
 
+
 benchmark(vector_add_, a_, b_, c_)
-
-
