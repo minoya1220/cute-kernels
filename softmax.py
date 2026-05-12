@@ -3,6 +3,7 @@ import operator
 import torch
 import cutlass.cute as cute
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
+from cutlass.cute.runtime import from_dlpack
 # Online Safe Softmax algorithm
 # first pass: reduction - find sum(e^(x-running_max))
 # second pass: elementwise ops, do e^(x-max) / first_pass_sum
@@ -69,8 +70,16 @@ def softmax_fwd_kernel(gX: cute.Tensor, gY: cute.Tensor):
 
 
 @cute.jit
-def softmax_fwd_launcher(T):
+def softmax_fwd_launcher(mX, mY):
+    # mX is the input tensor, mY is the output
     block_size = 256
+
+    
+    fwd_kernel = softmax_fwd_kernel(mX, mY)
+    fwd_kernel.launch(
+        grid=(cute.size(mX.shape[:-1]), 1, 1),
+        block=(block_size, 1, 1)
+    )
 
     pass
 
@@ -86,7 +95,15 @@ def softmax_bwd_launcher(T):
 
 
 if __name__ == "__main__":
-    x = torch.randn(2**5)
-    torch_softmax = torch.nn.Softmax(dim=0)
-    print(x)
-    print(torch_softmax(x, dim=0))
+    X = torch.randn(2**6,2**10, device='cuda', dtype=torch.float32)
+    Y = torch.randn(2**6,2**10, device='cuda', dtype=torch.float32)
+
+    x_ = from_dlpack(X, assumed_align=16)
+    y_ = from_dlpack(Y, assumed_align=16)
+
+
+    torch_softmax = torch.softmax(X, dim=1)
+    softmax_fwd_ = cute.compile(softmax_fwd_launcher, X, Y)
+    softmax_fwd_(X, Y)
+    torch.testing.assert_close(torch_softmax, Y)
+    print("success")

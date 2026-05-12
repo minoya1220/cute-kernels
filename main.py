@@ -182,7 +182,7 @@ def vector_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor, op: cutlass.Co
     # -------------------
 
     # ------ V4 --------
-    coalesced_bytes = 16 # max size of a memory transaction (128b)
+    coalesced_bytes = 16 # size of a memory transaction (128b)
 
     assert all(t.element_type == inputs[0].element_type for t in inputs)
     dtype = inputs[0].element_type
