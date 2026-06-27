@@ -24,7 +24,7 @@ def softmax_fwd_kernel(gX: cute.Tensor, gY: cute.Tensor, cX: cute.Tensor, tv_lay
     reduction_buffer = smem.allocate_tensor(cutlass.Float32, buffer_layout, byte_alignment=16)
     max_buffer = smem.allocate_tensor(cutlass.Float32, buffer_layout, byte_alignment=16)
     
-    blk_coord = (bidx, None)
+    blk_coord = (None, bidx)
     blkX = cute.local_tile(gX, tiler, blk_coord) # divides the block into tiles, boundary checks still have to be included
     blkY = cute.local_tile(gY, tiler, blk_coord)
     cblkX = cute.local_tile(cX, tiler, blk_coord)
@@ -46,8 +46,7 @@ def softmax_fwd_kernel(gX: cute.Tensor, gY: cute.Tensor, cX: cute.Tensor, tv_lay
 
     M, N = shape
 
-    m = bidx
-    n_iters = cute.ceil_div(N, bdim)
+    n_iters = cute.ceil_div(M, bdim)
     rPred = cute.make_fragment(cthrX.shape, cutlass.Boolean)
     rX = cute.make_rmem_tensor_like(thrX)
 
@@ -57,16 +56,22 @@ def softmax_fwd_kernel(gX: cute.Tensor, gY: cute.Tensor, cX: cute.Tensor, tv_lay
     for ni in range(0, n_iters):
         # load and do the reduction
         rPred[ni] = cute.elem_less(cthrX[ni], shape)
-        rX[ni] = thrX[ni].load() if rPred[ni] else -Float32.inf
+        rX[ni] = thrX[ni] if rPred[ni] else -Float32.inf
+        if tidx == 0 and bidx == 0: 
+            cute.printf("ni=%d rX=%f pred=%d cthrX=(%d, %d) shape=(%d, %d)", ni, rX[ni], rPred[ni], cthrX[ni][0], cthrX[ni][1], shape[0], shape[1])
         prev_max = thread_max
         thread_max = cute.arch.fmax(rX[ni], thread_max)
         accum = accum * cute.math.exp(prev_max - thread_max) + cute.math.exp(rX[ni] - thread_max)
+        
+    
 
     # intra-warp reduction
     warp_max = cute.arch.warp_reduction(thread_max, cute.arch.fmax)
     accum = accum * cute.math.exp(thread_max - warp_max)
     accum = cute.arch.warp_reduction(accum, operator.add)
     
+    
+
     # write each warp result to SMEM
     if lidx == 0:
         reduction_buffer[widx] = accum
@@ -80,36 +85,50 @@ def softmax_fwd_kernel(gX: cute.Tensor, gY: cute.Tensor, cX: cute.Tensor, tv_lay
     partial_result = partial_result * cute.math.exp(partial_max - full_max)
     divisor = cute.arch.warp_reduction(partial_result, operator.add)
 
+
     # elementwise finisher
     for ni in range(0, n_iters):
         if rPred[ni]:
             elem = rX[ni]
             thrY[ni] = cute.math.exp(elem - full_max) / divisor
 
-
-@cute.jit
-def softmax_fwd_launcher(mX, mY):
+## TODO: wrap this inside of a python function and put the tv layout construction in there so
+def softmax_fwd_builder(mX, mY):
     # mX is the input tensor, mY is the output
     bdim = BLOCK_SIZE
     shape = mX.shape
     M, N = shape
+    n_iters = (M + bdim - 1) // bdim
 
-    n_iters = cute.ceil_div(N, bdim)
 
-    thr_layout = cute.make_layout((bdim,))
-    val_layout = cute.make_layout((n_iters,), (bdim,))
-    # use cute.recast_layout to make this work for arbitrary dtypes
-    tiler, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
-    
-    gX = mX # cute.zipped_divide(mY, tiler=tiler)
-    gY = mY # cute.zipped_divide(mX, tiler=tiler)
-    cX = cute.make_identity_tensor(mX.shape) # cute.zipped_divide(cute.make_identity_tensor(mX.shape), tiler=tiler)
+    @cute.jit
+    def softmax_fwd_launcher(mX, mY):
+        # copy_atom = cute.make_copy_atom(
+        #     cute.nvgpu.CopyUniversalOp(),
+        #     mX.element_type,
+        #     num_bits_per_copy=128
+        # )
 
-    fwd_kernel = softmax_fwd_kernel(gX, gY, cX, tv_layout, tiler, shape)
-    fwd_kernel.launch(
-        grid=(cute.size(mX.shape[:-1]), 1, 1),
-        block=(cute.size(tv_layout, mode=[0]), 1, 1)
-    )
+        thr_layout = cute.make_layout((bdim,), stride=((1,)))
+        val_layout = cute.make_layout((n_iters,), stride=((1,)))
+        # use cute.recast_layout to make this work for arbitrary dtypes
+        # tiler, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+        # tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
+        tv_layout = cute.logical_product(thr_layout, val_layout)
+        tiler = (cute.size(thr_layout) * cute.size(val_layout),)
+        
+        print(f"tv_layout: {tv_layout}")
+        print(f"tiler: {tiler}")
+        gX = mX # cute.zipped_divide(mY, tiler=tiler)
+        gY = mY # cute.zipped_divide(mX, tiler=tiler)
+        cX = cute.make_identity_tensor(mX.shape) # cute.zipped_divide(cute.make_identity_tensor(mX.shape), tiler=tiler)
+
+        fwd_kernel = softmax_fwd_kernel(gX, gY, cX, tv_layout, tiler, shape)
+        fwd_kernel.launch(
+            grid=(cute.size(mX.shape[:-1]), 1, 1),
+            block=(cute.size(tv_layout, mode=[0]), 1, 1)
+        )
+    return cute.compile(softmax_fwd_launcher, mX, mY)
 
 
 @cute.kernel
@@ -124,15 +143,15 @@ def softmax_bwd_launcher(T):
 
 
 if __name__ == "__main__":
-    X = torch.randn(2**6,2**10, device='cuda', dtype=torch.float32)
-    Y = torch.randn(2**6,2**10, device='cuda', dtype=torch.float32)
+    X = torch.randn(2**10,2**6, device='cuda', dtype=torch.float32)
+    Y = torch.randn(2**10,2**6, device='cuda', dtype=torch.float32)
 
-    x_ = from_dlpack(X, assumed_align=16)
-    y_ = from_dlpack(Y, assumed_align=16)
+    x_ = from_dlpack(X.T, assumed_align=16)
+    y_ = from_dlpack(Y.T, assumed_align=16)
 
 
-    torch_softmax = torch.softmax(X, dim=1)
-    softmax_fwd_ = cute.compile(softmax_fwd_launcher, X, Y)
+    torch_softmax = torch.softmax(X, dim=0)
+    softmax_fwd_ = softmax_fwd_builder(X, Y)
     softmax_fwd_(X, Y)
     torch.testing.assert_close(torch_softmax, Y)
     print("success")
