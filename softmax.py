@@ -8,9 +8,7 @@ from math import gcd
 # Online Safe Softmax algorithm
 # first pass: reduction - find sum(e^(x-running_max))
 # second pass: elementwise ops, do e^(x-max) / first_pass_sum
-# assume f32 to start make more general later
 # 
-BLOCK_SIZE = 256
 
 @cute.kernel
 def softmax_fwd_kernel(
@@ -26,7 +24,6 @@ def softmax_fwd_kernel(
     ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
-    bdim = BLOCK_SIZE # , _, _ = cute.arch.block_dim() # ensures that this value is known at compile time
     widx, lidx = cute.arch.warp_idx(), cute.arch.lane_idx()
     
     smem = cutlass.utils.SmemAllocator()
@@ -58,22 +55,17 @@ def softmax_fwd_kernel(
         print(tXgX.layout)
 
 
-    # deletes trailing degenerate modes from partitioning
+    # deletes trailing degenerate modes from partitioning, required for later indexing to work
     tXgX = cute.make_tensor(tXgX.iterator, cute.get(tXgX.layout, mode=[0]))  
     tXcX = cute.make_tensor(tXcX.iterator, cute.get(tXcX.layout, mode=[0]))
     tXgY = cute.make_tensor(tXgY.iterator, cute.get(tXgY.layout, mode=[0]))
     
-
-    
-
-
 
     # initialize SMEM buffers
     if widx == 0:
         reduction_buffer[lidx] = 0.0
         max_buffer[lidx] = -Float32.inf
     cute.arch.sync_threads()
-
     
     M, N = shape
 
@@ -86,11 +78,9 @@ def softmax_fwd_kernel(
         print("rPredveclayout")
         print(rPred.layout)
 
-    
-
     tXrX = cute.make_rmem_tensor_like(tXgX)
 
-    for ni in range(0, n_iters):
+    for ni in cutlass.range_constexpr(0, n_iters): # n_iters should be bounded
         rPred[(0,ni)] = cute.elem_less(tXcX[(vec_size - 1,ni)], shape) # if the end of a vector is oob then the whole vector is ineligible
         
         if cutlass.const_expr(tiler[1] > N): # filling -inf only necessary when tiling goes past N
@@ -100,31 +90,30 @@ def softmax_fwd_kernel(
 
     # Loading elements from GMEM to register tensors
     cute.copy(tiled_copy, tXgX, tXrX, pred=rPred)
-    # if cutlass.const_expr(N % vec_size != 0): # loading non vectorized elements for tail case
-    #     for i in cutlass.range_constexpr(vec_size):
-    #         if cute.elem_less(tXcX[(i, n_iters - 1)], shape):
-    #             tXrX[(i, n_iters - 1)] = tXgX[(i, n_iters - 1)]
+
+    thread_max = -Float32.inf
+    for ni in cutlass.range_constexpr(0, n_iters):
+        for i in cutlass.range_constexpr(vec_size): # range constexpr loops get unrolled
+            thread_max = cute.arch.fmax(tXrX[i, ni].to(Float32), thread_max)
 
     # single pass online safe softmax
     accum = 0.0
-    thread_max = -Float32.inf
-    for ni in range(0, n_iters):
-        # load and do the reduction
-        for i in cutlass.range_constexpr(vec_size): # range constexpr loops get unrolled
-            if tidx == 255 and bidx == 15: 
-                cute.printf("i=%d ni=%d tXrX=%f pred=%d tXcX=(%d, %d) shape=(%d, %d)", i, ni, tXrX[i, ni], rPred[i, ni], tXcX[i, ni][0], tXcX[i, ni][1], shape[0], shape[1])
-            
-            prev_max = thread_max
-            thread_max = cute.arch.fmax(tXrX[i, ni], thread_max)
-            accum = accum * cute.math.exp(prev_max - thread_max) + cute.math.exp(tXrX[i, ni] - thread_max)
-        
+    if thread_max != -Float32.inf: # if it is -inf accum is guaranteed to be 0
+        for ni in cutlass.range_constexpr(0, n_iters):
+            # load and do the reduction
+            for i in cutlass.range_constexpr(vec_size): # range constexpr loops get unrolled
+                if tidx == 255 and bidx == 15: 
+                    cute.printf("i=%d ni=%d tXrX=%f pred=%d tXcX=(%d, %d) shape=(%d, %d)", i, ni, tXrX[i, ni].to(Float32), rPred[i, ni], tXcX[i, ni][0], tXcX[i, ni][1], shape[0], shape[1])
+                
+                accum = accum + cute.math.exp(tXrX[i, ni].to(Float32) - thread_max)
         
     
 
     # intra-warp reduction
     warp_max = cute.arch.warp_reduction(thread_max, cute.arch.fmax)
-    accum = accum * cute.math.exp(thread_max - warp_max)
-    accum = cute.arch.warp_reduction(accum, operator.add)
+    if warp_max != -Float32.inf: # thread_max and warp_max would have to -inf guaranteeing accum continues to be 0 
+        accum = accum * cute.math.exp(thread_max - warp_max) 
+        accum = cute.arch.warp_reduction(accum, operator.add)
     
     
 
@@ -143,30 +132,32 @@ def softmax_fwd_kernel(
 
 
     # elementwise finisher
-    for ni in range(0, n_iters):
+    for ni in cutlass.range_constexpr(0, n_iters):
         for i in cutlass.range_constexpr(vec_size):
             if rPred[i, ni]:
-                tXgY[i, ni] = cute.math.exp(tXrX[i, ni] - full_max) / divisor
-        # if cutlass.const_expr(N % vec_size == 0):
-        #     for i in cutlass.range_constexpr(vec_size):
-        #         if rPred[i, ni]:
-        #             tXgY[i, ni] = cute.math.exp(tXrX[i, ni] - full_max) / divisor
+                tXgY[i, ni] = (cute.math.exp(tXrX[i, ni].to(Float32) - full_max) / divisor).to(tXgY.element_type)
 
-def softmax_fwd_builder(mX, mY):
+def softmax_fwd_builder(X: torch.Tensor, Y: torch.Tensor):
+    assert X.shape == Y.shape and X.stride() == Y.stride()
+    assert X.is_contiguous()
+
+    mX = from_dlpack(X, assumed_align=16)
+    mY = from_dlpack(Y, assumed_align=16)
+    
     # mX is the input tensor, mY is the output
-    bdim = BLOCK_SIZE
     shape = mX.shape
     M, N = shape
+    bdim = 256
+    assert N != 0
 
     max_vec_size = 128 // mX.element_type.width
     vec_size = gcd(N, max_vec_size) # gcd is necessary because torch tensor dims arent padded for byte alignment
     bits_per_vec = vec_size * mX.element_type.width
-    # vec_size = bits_per_vec // mX.element_type.width
     n_iters = (N + bdim * vec_size - 1) // (bdim * vec_size)
     print(n_iters)
 
-    # TODO: implement async copies, backward pass, benchmark, add assertions for contiguity, 
-    #       verify ncu profile, add auto reshaping incase of mulitple batch dims, and add epilogue.
+    # TODO: implement async copies, backward pass, benchmark,
+    #       verify ncu profile, add auto reshaping incase of mulitple batch dims, and add epilogue. also remove online softmax
 
     @cute.jit
     def softmax_fwd_launcher(mX, mY):
@@ -181,8 +172,7 @@ def softmax_fwd_builder(mX, mY):
         print(f"n_iters: {n_iters}")
         print(f"thr_layout: {thr_layout}")
         print(f"val_layout: {val_layout}")
-        # use cute.recast_layout to make this work for arbitrary dtypes
-        # tiler, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+
         tv_layout = cute.logical_product(thr_layout, val_layout)
         tiler = (1, cute.size(thr_layout) * cute.size(val_layout))
         tiled_copy = cute.make_tiled_copy(copy_atom, tv_layout, tiler)
@@ -211,15 +201,14 @@ def softmax_bwd_launcher(T):
 
 
 if __name__ == "__main__":
-    X = torch.rand(2**6,2**13+255, device='cuda', dtype=torch.float16)
-    Y = torch.rand(2**6,2**13+255, device='cuda', dtype=torch.float16)
-
-    x_ = from_dlpack(X, assumed_align=16)
-    y_ = from_dlpack(Y, assumed_align=16)
+    X = torch.rand(2**6,2**15, device='cuda', dtype=torch.bfloat16)
+    Y = torch.rand(2**6,2**15, device='cuda', dtype=torch.bfloat16)
 
 
-    torch_softmax = torch.softmax(X.double(), dim=1).float()
-    softmax_fwd_ = softmax_fwd_builder(x_, y_)
-    softmax_fwd_(x_, y_)
+
+
+    torch_softmax = torch.softmax(X.double(), dim=1).to(X.dtype)
+    softmax_fwd_ = softmax_fwd_builder(X, Y)
+    softmax_fwd_(X, Y)
     torch.testing.assert_close(torch_softmax, Y)
     print("success")
