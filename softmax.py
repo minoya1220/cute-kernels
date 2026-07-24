@@ -352,7 +352,7 @@ def benchmark_fwd(dims: list[int], dtype=torch.bfloat16) -> list[float]:
     times = []
     
     for dim in dims:
-        X = torch.randn(2**6, dim, device='cuda', dtype=dtype)
+        X = torch.randn(2**23//dim, dim, device='cuda', dtype=dtype)
         softmax_fwd = softmax_fwd_builder(X)
 
         times.append(benchmark(softmax_fwd, [X]))
@@ -375,9 +375,9 @@ def test_bwd(dims: list[int], dtype=torch.bfloat16):
 def benchmark_bwd(dims: list[int], dtype=torch.bfloat16) -> list[float]:
     times = []
     for dim in dims:
-        Y = torch.randn(2**6, dim, device='cuda', dtype=dtype)
+        Y = torch.randn(2**23//dim, dim, device='cuda', dtype=dtype)
         dY = torch.randn_like(Y)
-        softmax_bwd = softmax_bwd_builder()
+        softmax_bwd = softmax_bwd_builder(Y, dY)
         times.append(benchmark(softmax_bwd, [Y, dY]))
     
     return times
@@ -405,13 +405,36 @@ def benchmark(fn: callable, inputs: list[torch.Tensor], warmup=10, iters=100, L2
     for i in range(0, iters):
         fn(*inputs_buffers[i % n_buffers])
     end.record()
+    
+    torch.cuda.synchronize()
 
     avg_time = start.elapsed_time(end) / iters
     return avg_time
 
 if __name__ == "__main__":
     torch.manual_seed(123)
-    test_dims = [3, 7, 8, 100, 257, 1021, 2048, 2049, 4099, 8192, 32768, 131072]
-    test_fwd(test_dims)
-    test_bwd(test_dims)
+    # test_dims = [3, 7, 8, 100, 257, 1021, 2048, 2049, 4099, 8192, 32768, 131072]
+    # test_fwd(test_dims)
+    # test_bwd(test_dims)
+    bench_dims = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+    fwd_times = benchmark_fwd(bench_dims)
+    bwd_times = benchmark_bwd(bench_dims)
+    print(f"avg fwd: {fwd_times}")
+    print(f"avg bwd: {bwd_times}")
+    
+    
+    import matplotlib.pyplot as plt
+
+    def plot_bench(dims, times, n_tensors, label, dtype=torch.bfloat16, peak_gbps=504):
+        esize = torch.finfo(dtype).bits // 8
+        bw = [n_tensors * 2**23 * esize / (t*1e-3) / 1e9 for t in times]
+        plt.plot(dims, [b/peak_gbps*100 for b in bw], 'o-', label=label)
+        plt.xscale('log', base=2); plt.xlabel('N'); plt.ylabel('% of peak BW'); plt.ylim(0, 100)
+        plt.xticks(dims, [str(N) for N in dims], rotation=90, ha='right')
+        plt.legend()
+        plt.savefig(f'bench.png', dpi=150)
+
+    plot_bench(bench_dims, fwd_times, 2, 'fwd')
+    plot_bench(bench_dims, bwd_times, 3, 'bwd')  
+    
     print("success")
