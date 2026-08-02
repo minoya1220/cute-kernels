@@ -2,11 +2,13 @@ import cutlass
 import operator
 import torch
 import cutlass.cute as cute
+import cuda.bindings.driver as cuda
+from collections.abc import Iterable, Callable
 from cutlass import Float32, Boolean, const_expr
 from cutlass.cute.runtime import from_dlpack
 from math import gcd
 
-def warp_reduction_partial(value: cute.typing.Numeric, op: callable, width: int) -> cute.typing.Numeric:
+def warp_reduction_partial(value: cute.typing.Numeric, op: Callable, width: int) -> cute.typing.Numeric:
     assert 1 <= width and width <= 32, f"width must be in [1,32], got {width}"
     assert (width & (width - 1)) == 0, f"width must be a power of 2, got {width}"
     result = value
@@ -104,11 +106,10 @@ def softmax_fwd_kernel(
         for i in cutlass.range_constexpr(vec_size): # range constexpr loops get unrolled
             thread_max = cute.arch.fmax(tXrX[i, ni].to(Float32), thread_max)
 
-    # single pass online safe softmax
+    # single pass safe softmax
     accum = 0.0
     if thread_max != -Float32.inf: # if it is -inf accum is guaranteed to be 0
         for ni in cutlass.range_constexpr(n_iters):
-            # load and do the reduction
             for i in cutlass.range_constexpr(vec_size): # range constexpr loops get unrolled
                 # if tidx == 255 and bidx == 15: 
                 #     cute.printf("i=%d ni=%d tXrX=%f pred=%d tXcX=(%d, %d) shape=(%d, %d)", i, ni, tXrX[i, ni].to(Float32), rPred[i, ni], tXcX[i, ni][0], tXcX[i, ni][1], shape[0], shape[1])
@@ -150,7 +151,7 @@ def softmax_fwd_kernel(
                 tXgY[i, ni] = (cute.math.exp(tXrX[i, ni].to(Float32) - full_max) / divisor).to(tXgY.element_type)
 
 
-def softmax_fwd_builder(X: torch.Tensor) -> callable:
+def softmax_fwd_builder(X: torch.Tensor) -> Callable:
     assert X.is_contiguous()
     
     Y = torch.empty_like(X) 
@@ -158,7 +159,7 @@ def softmax_fwd_builder(X: torch.Tensor) -> callable:
     mY = from_dlpack(Y, assumed_align=16)
 
     M, N = mX.shape
-    bdim = 256
+    bdim = 512 # 256, 512, 1024 all work, gives different perf for >2**16
     assert N > 1
 
     max_vec_size = 128 // mX.element_type.width # 128 bits is largest ld/st instruction
@@ -171,9 +172,8 @@ def softmax_fwd_builder(X: torch.Tensor) -> callable:
     rows_per_block = bdim // threads_per_row 
 
 
-    # TODO: multi row, async copies, online/SMEM retrieval for large row sizes
     @cute.jit
-    def softmax_fwd_launcher(mX: cute.Tensor, mY: cute.Tensor):
+    def softmax_fwd_launcher(mX: cute.Tensor, mY: cute.Tensor, stream: cuda.CUstream = cuda.CUstream(0)):
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             mX.element_type,
@@ -200,17 +200,21 @@ def softmax_fwd_builder(X: torch.Tensor) -> callable:
         num_blocks = (cute.size(mX.shape[0]) + rows_per_block - 1) // rows_per_block
         fwd_kernel.launch(
             grid=(num_blocks, 1, 1),
-            block=(cute.size(tv_layout, mode=[0]), 1, 1)
+            block=(cute.size(tv_layout, mode=[0]), 1, 1),
+            stream=stream
         )
 
 
     compiled_kernel = cute.compile(softmax_fwd_launcher, mX, mY)
     
-    def kernel_wrapper(X: torch.Tensor) -> torch.Tensor:
+    def kernel_wrapper(X: torch.Tensor, *, out: torch.Tensor = None) -> torch.Tensor:
         original_shape = X.shape
         X = X.flatten(0,-2)
-        Y = torch.empty_like(X)
-        compiled_kernel(X, Y)
+        Y = torch.empty_like(X) if out is None else out
+        
+        s = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        compiled_kernel(X, Y, stream=s)
+        
         return Y.view(original_shape)
     
     return kernel_wrapper
@@ -307,7 +311,7 @@ def softmax_bwd_kernel(
     
 
 
-def softmax_bwd_builder(Y: torch.Tensor, dY: torch.Tensor) -> callable:
+def softmax_bwd_builder(Y: torch.Tensor, dY: torch.Tensor) -> Callable:
     assert Y.shape == dY.shape and Y.stride() == dY.stride()
     assert Y.is_contiguous()
 
@@ -327,7 +331,7 @@ def softmax_bwd_builder(Y: torch.Tensor, dY: torch.Tensor) -> callable:
 
 
     @cute.jit
-    def softmax_bwd_launcher(mY: cute.Tensor, mdY: cute.Tensor, mdX: cute.Tensor):
+    def softmax_bwd_launcher(mY: cute.Tensor, mdY: cute.Tensor, mdX: cute.Tensor, stream: cuda.CUstream = cuda.CUstream(0)):
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             mY.element_type,
@@ -346,16 +350,19 @@ def softmax_bwd_builder(Y: torch.Tensor, dY: torch.Tensor) -> callable:
         compiled_kernel = softmax_bwd_kernel(mY, mdY, mdX, cY, tv_layout, tiler, mY.shape, tiled_copy, n_iters, vec_size)
         compiled_kernel.launch(
             grid=(cute.size(mY.shape[:-1]), 1, 1),
-            block=(cute.size(tv_layout, mode=[0]), 1, 1)
+            block=(cute.size(tv_layout, mode=[0]), 1, 1),
+            stream=stream
         )
     
     compiled_kernel = cute.compile(softmax_bwd_launcher, mY, mdY, mdX)
 
-    def kernel_wrapper(Y: torch.Tensor, dY: torch.Tensor) -> torch.Tensor:
+    def kernel_wrapper(Y: torch.Tensor, dY: torch.Tensor,*, out: torch.Tensor = None) -> torch.Tensor:
         original_shape = Y.shape
         Y = Y.flatten(0,-2).detach()
-        dX = torch.empty_like(Y)
-        compiled_kernel(Y, dY, dX)
+        dX = torch.empty_like(Y) if out is None else out
+
+        s = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        compiled_kernel(Y, dY, dX, s)
         return dX.view(original_shape)
     
     return kernel_wrapper
@@ -369,16 +376,25 @@ def test_fwd(dims: list[int], dtype=torch.bfloat16):
 
         torch_softmax = torch.softmax(X.double(), dim=1).to(X.dtype)
         softmax_fwd = softmax_fwd_builder(X)
-        torch.testing.assert_close(torch_softmax, softmax_fwd(X))
- 
+        try:
+            torch.testing.assert_close(torch_softmax, softmax_fwd(X))
+            print(f"dim={dim} passed")
+
+        except AssertionError as e:
+            print(f"dim={dim} failed")
+
 def benchmark_fwd(dims: list[int], dtype=torch.bfloat16) -> list[float]:
     times = []
     
     for dim in dims:
-        X = torch.randn(2**23//dim, dim, device='cuda', dtype=dtype)
+        p = torch.cuda.get_device_properties(0)
+        M = (2**29//dim + p.multi_processor_count - 1) // p.multi_processor_count * p.multi_processor_count
+        M =  2**29//dim
+        X = torch.randn(M, dim, device='cuda', dtype=dtype)
+        Y = torch.empty_like(X)
         softmax_fwd = softmax_fwd_builder(X)
 
-        times.append(benchmark(softmax_fwd, [X]))
+        times.append(benchmark(softmax_fwd, [X], [Y]))
     
     return times
 
@@ -398,76 +414,200 @@ def test_bwd(dims: list[int], dtype=torch.bfloat16):
 def benchmark_bwd(dims: list[int], dtype=torch.bfloat16) -> list[float]:
     times = []
     for dim in dims:
-        Y = torch.randn(2**23//dim, dim, device='cuda', dtype=dtype)
+        Y = torch.randn(2**29//dim, dim, device='cuda', dtype=dtype)
         dY = torch.randn_like(Y)
+        dX = torch.empty_like(Y)
         softmax_bwd = softmax_bwd_builder(Y, dY)
-        times.append(benchmark(softmax_bwd, [Y, dY]))
+        times.append(benchmark(softmax_bwd, [Y, dY], [dX]))
     
     return times
 
-def benchmark(fn: callable, inputs: list[torch.Tensor], warmup=10, iters=100, L2_clear=True):
-    inputs_buffers = [[input_tensor for input_tensor in inputs]]
-    
-    if L2_clear:
-        input_size = sum([input_tensor.nbytes for input_tensor in inputs])
-        buffer_size = 256 * 2**20 # 256 MB clears l2 for all modern gpus
-        n_buffers = buffer_size // input_size
+def benchmark(fn: Callable, inputs: Iterable[torch.Tensor] | torch.Tensor = (), outputs: Iterable[torch.Tensor] | torch.Tensor = (),*, warmup=20, iters=100, L2_clear=True):
+    inputs = (inputs,) if isinstance(inputs, torch.Tensor) else tuple(inputs)
+    outputs = (outputs,) if isinstance(outputs, torch.Tensor) else tuple(outputs)
 
-        inputs_buffers = [[input_tensor.clone() for input_tensor in inputs] for _ in range(0, n_buffers)]
-    
-    
-    for _ in range(0, warmup):
-        fn(*inputs_buffers[0])
-    
+    inputs_buffers = [inputs]
+    outputs_buffers = [outputs]
+    n_buffers = 1
+
+    if L2_clear:
+        assert inputs and outputs, "Input and Output Tensors are required to rotate L2"
+        size = sum([t.nbytes for t in (*inputs, *outputs)])
+        buffer_size = 256 * 2**20 # 256 MB clears l2 for all modern gpus
+        n_buffers =  min(iters, buffer_size // size + 1)
+
+        inputs_buffers = [tuple(t.clone() for t in inputs) for _ in range(0, n_buffers)]
+        outputs_buffers = [tuple(t.clone() for t in outputs) for _ in range(0, n_buffers)]
+
+    num_outs = len(outputs_buffers[0])
+    if num_outs == 0:
+        caller = lambda i, o: fn(*i)
+    elif num_outs == 1:
+        caller = lambda i, o: fn(*i, out=o[0]) 
+    else:
+        caller = lambda i, o: fn(*i, out=o)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for i in range(0, warmup):
+            caller(inputs_buffers[i % n_buffers], outputs_buffers[i % n_buffers])
+    torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
+    
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
-    start.record()
-    for i in range(0, iters):
-        fn(*inputs_buffers[i % n_buffers])
-    end.record()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for i in range(0, iters):
+            caller(inputs_buffers[i % n_buffers], outputs_buffers[i % n_buffers])
     
     torch.cuda.synchronize()
-
-    avg_time = start.elapsed_time(end) / iters
-    return avg_time
+    times = []
+    for i in range(5):
+        start.record()
+        g.replay()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end) / iters)
+    times.sort()
+    median_time = times[len(times) // 2]
+    return median_time
 
 if __name__ == "__main__":
-    # p = torch.cuda.get_device_properties(0)
-    # bw = p.memory_bus_width / 8 * p.memory_clock_rate * 1e3 * 2 / 1e9  # GB/s
-    # print(f"{bw} GB/s")
-    # torch.manual_seed(123)
-    # test_dims = [3, 7, 8, 100, 257, 1021, 2048, 2049, 4099, 8192, 32768, 131072]
-    # test_fwd(test_dims)
+    
+    torch.manual_seed(123)
+    test_dims = [3, 7, 8, 64, 100, 257, 1021, 2048, 2049, 4099, 8192, 32768, 131072]
+    bench_dims = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+    # test_fwd(bench_dims + test_dims)
     # test_bwd(test_dims)
-    # bench_dims = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
-    # fwd_times = benchmark_fwd(bench_dims)
+
+    fwd_times = benchmark_fwd(bench_dims)
     # bwd_times = benchmark_bwd(bench_dims)
-    # print(f"avg fwd: {fwd_times}")
-    # print(f"avg bwd: {bwd_times}")
     
-    
-    # import matplotlib.pyplot as plt
 
-    # def plot_bench(dims, times, n_tensors, label, dtype=torch.bfloat16, peak_gbps=448):
-    #     esize = torch.finfo(dtype).bits // 8
-    #     bw = [n_tensors * 2**23 * esize / (t*1e-3) / 1e9 for t in times]
-    #     plt.plot(dims, [b/peak_gbps*100 for b in bw], 'o-', label=label)
-    #     plt.xscale('log', base=2); plt.xlabel('N'); plt.ylabel('% of peak BW'); plt.ylim(0, 200)
-    #     plt.xticks(dims, [str(N) for N in dims], rotation=90, ha='right')
-    #     plt.legend()
-    #     plt.savefig(f'bench.png', dpi=150)
+    def plot_bench(dims, times, n_tensors, label, dtype=torch.bfloat16):
+        p = torch.cuda.get_device_properties(0)
+        peak_gbps = p.memory_bus_width / 8 * p.memory_clock_rate * 1e3 * 2 / 1e9  # GB/s
+        import matplotlib.pyplot as plt
+        esize = torch.finfo(dtype).bits // 8
+        bw = [n_tensors * 2**29 * esize / (t*1e-3) / 1e9 for t in times]
+        plt.plot(dims, [b/peak_gbps*100 for b in bw], 'o-', label=label)
+        plt.xscale('log', base=2); plt.xlabel('N'); plt.ylabel('% of peak BW'); plt.ylim(0, 100)
+        plt.xticks(dims, [str(N) for N in dims], rotation=90, ha='right')
+        plt.legend()
+        plt.savefig(f'bench.png', dpi=150)
+ 
 
-    # plot_bench(bench_dims, fwd_times, 2, 'fwd')
+    def plot_fwd(dims, times, dtype=torch.bfloat16, *, elems=2**29, sizes=None, font='Lora', path='fwd_bench256.png'):
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import FuncFormatter
+
+        c = dict(bg='#1d2021', fg='#ebdbb2', muted='#928374', grid='#32302f',
+                spine='#504945', band='#282828', line='#83a598')
+        s = {**dict(base=11.5, title=13.5, axis_label=11.5, tick=9.5, ref=9.5),
+            **(sizes or {})}
+
+        p = torch.cuda.get_device_properties(0)
+        peak = p.memory_bus_width / 8 * p.memory_clock_rate * 1e3 * 2 / 1e9
+
+        # empirical 1r+1w reference: a plain torch copy of the same total size
+        n = elems * 2 // (torch.finfo(dtype).bits // 8)
+        src = torch.randn(n, device='cuda', dtype=dtype)
+        dst = torch.empty_like(src)
+        t_ref = benchmark(lambda a, *, out: out.copy_(a), [src], [dst])
+        ref = 2 * src.nbytes / (t_ref * 1e-3) / 1e9
+
+        esize = torch.finfo(dtype).bits // 8
+        gb = [2 * elems * esize / (t * 1e-3) / 1e9 for t in times]
+
+        rc = {
+            'font.family': 'serif',
+            'font.serif': [font, 'TeX Gyre Pagella', 'DejaVu Serif'],
+            'mathtext.fontset': 'cm', 'font.size': s['base'],
+            'figure.facecolor': c['bg'], 'axes.facecolor': c['bg'],
+            'savefig.facecolor': c['bg'],
+            'text.color': c['fg'], 'axes.labelcolor': c['fg'],
+            'xtick.color': c['muted'], 'ytick.color': c['muted'],
+            'axes.edgecolor': c['spine'], 'axes.linewidth': 0.8,
+            'xtick.major.size': 3, 'ytick.major.size': 3,
+            'axes.spines.top': False, 'axes.spines.right': False,
+        }
+
+        with plt.rc_context(rc):
+            fig, ax = plt.subplots(figsize=(7.6, 4.8),
+                                constrained_layout=dict(w_pad=0.18, h_pad=0.16))
+            top, xr = peak * 1.10, dims[-1] * 1.42
+
+            ax.set_axisbelow(True)
+            ax.grid(axis='y', color=c['grid'], lw=0.7)
+            ax.axhspan(peak, top, color=c['band'], lw=0, zorder=0)
+            ax.axhline(ref, ls='--', lw=1.0, color=c['muted'], zorder=2)
+            ax.axhline(peak, ls=':', lw=1.0, color=c['muted'], zorder=2)
+
+            ax.fill_between(dims, gb, color=c['line'], alpha=0.10, zorder=1)
+            ax.plot(dims, gb, 'o-', ms=5, lw=2, color=c['line'], zorder=3)
+
+            # sit just above each line, left-inset from the spine
+            for y, txt in [(peak, f'theoretical peak · {peak:.0f} GB/s'),
+                        (ref, f'torch copy reference (1r+1w) · {ref:.0f} GB/s')]:
+                ax.annotate(txt, xy=(0.015, y), xycoords=ax.get_yaxis_transform(),
+                            xytext=(0, 3), textcoords='offset points',
+                            fontsize=s['ref'], color=c['muted'],
+                            ha='left', va='bottom', zorder=4)
+
+            ax.set_xscale('log', base=2)
+            ax.set_xticks(dims)
+            ax.set_xticklabels([str(d) for d in dims], rotation=45, ha='right',
+                            rotation_mode='anchor', fontsize=s['tick'])
+            ax.tick_params(axis='y', labelsize=s['tick'])
+            ax.set_xlim(dims[0] / 1.55, xr)
+            ax.set_ylim(0, top)
+            ax.set_xlabel('row length $N$', labelpad=8, fontsize=s['axis_label'])
+            ax.set_ylabel('achieved bandwidth (GB/s)', labelpad=8,
+                        fontsize=s['axis_label'])
+            ax.set_title('Softmax Forward', fontsize=s['title'], loc='left',
+                        color=c['line'], pad=12)
+
+            sec = ax.secondary_yaxis(
+                'right', functions=(lambda g: g / peak * 100, lambda q: q / 100 * peak))
+            sec.set_ylabel('% of theoretical peak', labelpad=10,
+                        fontsize=s['axis_label'])
+            sec.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{v:.0f}%'))
+            sec.spines['right'].set_visible(True)
+            sec.spines['right'].set_color(c['spine'])
+            sec.tick_params(colors=c['muted'], labelsize=s['tick'])
+            sec.yaxis.label.set_color(c['fg'])
+
+            fig.savefig(path, dpi=150)
+            plt.close(fig)
+
+    plot_fwd(bench_dims, fwd_times)
     # plot_bench(bench_dims, bwd_times, 3, 'bwd')  
+    
+    # from torch.profiler import profile, ProfilerActivity
+    # with profile(
+    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #     record_shapes=True,
+    # ) as prof:
+    #     benchmark_fwd([2**14])
+    # prof.export_chrome_trace("trace.json")
 
-    # test_fwd([4321], dtype=torch.float32)
+    # benchmark_fwd([2**15])
+
     
     print("success")
 
-    # print([n for n in dir(cute.arch) if 'bfly' in n])
-    # help(cute.arch.shuffle_sync_bfly.func)
-    # import inspect
-    # print(inspect.getsource(cute.arch.warp_reduction))
+# TODO: implement warp indexing bug fix, generate plots based on locked clocks, port multiple rows per block to backwards, replace 2**29 with a global constant, split into multiple files, explore packed b16s, do a writeup
+
+# # rewrite to use layouts to organize reduction buffer
+# warp indexing bug fix 
+# warps_per_row = threads_per_row // 32
+# row_base = (widx // warps_per_row) * warps_per_row
+# idx = row_base + lidx % warps_per_row
+# partial_max = max_buffer[idx]
+# partial_result = reduction_buffer[idx]
+
+# ncu --set full -f -o softmax_fwd -k regex:cutlass_softmax_fwd --launch-skip 3 --launch-count 1 uv run softmax.py
