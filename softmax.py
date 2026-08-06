@@ -28,15 +28,20 @@ def softmax_fwd_kernel(
                     tiled_copy: cute.TiledCopy, 
                     n_iters: cutlass.Constexpr, 
                     vec_size: cutlass.Constexpr,
-                    threads_per_row: cutlass.Constexpr
+                    threads_per_row: cutlass.Constexpr,
+                    bdim: cutlass.Constexpr
     ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     widx, lidx = cute.arch.warp_idx(), cute.arch.lane_idx()
+
     M, N = shape
 
     smem = cutlass.utils.SmemAllocator()
-    buffer_layout = cute.make_layout(cute.arch.WARP_SIZE)
+
+    num_warps = bdim // cute.arch.WARP_SIZE
+    buffer_layout = cute.make_layout(num_warps)
+
     reduction_buffer = smem.allocate_tensor(cutlass.Float32, buffer_layout, byte_alignment=16)
     max_buffer = smem.allocate_tensor(cutlass.Float32, buffer_layout, byte_alignment=16)
     
@@ -73,11 +78,6 @@ def softmax_fwd_kernel(
     # if (tidx == 0 and bidx == 0):
     #     print(f"tXgX (trailing modes cleared): {tXgX.layout}")
 
-    if widx == 0:
-        reduction_buffer[lidx] = 0.0
-        max_buffer[lidx] = -Float32.inf
-    cute.arch.sync_threads()
-    
 
     # if (tidx == 0 and bidx == 0):
     #     print(tXgX.layout)
@@ -101,12 +101,13 @@ def softmax_fwd_kernel(
     # Loading elements from GMEM to register tensors
     cute.copy(tiled_copy, tXgX, tXrX, pred=rPred)
 
+    # intra-thread max
     thread_max = -Float32.inf
     for ni in cutlass.range_constexpr(n_iters):
         for i in cutlass.range_constexpr(vec_size): # range constexpr loops get unrolled
             thread_max = cute.arch.fmax(tXrX[i, ni].to(Float32), thread_max)
 
-    # single pass safe softmax
+    # intra-thread safe softmax numerator
     accum = 0.0
     if thread_max != -Float32.inf: # if it is -inf accum is guaranteed to be 0
         for ni in cutlass.range_constexpr(n_iters):
@@ -125,10 +126,11 @@ def softmax_fwd_kernel(
         accum = accum * cute.math.exp(thread_max - warp_max) 
         accum = warp_reduction_partial(accum, operator.add, min(threads_per_row, 32))
     
-    partial_max = warp_max
     partial_result = accum
+    partial_max = warp_max
+    
+    # inter-warp reduction
     if cutlass.const_expr(threads_per_row > 32):
-        # think about case with 2 or more rows, dont think this works
         # write each warp result to SMEM
         if lidx == 0:
             reduction_buffer[widx] = accum
@@ -136,15 +138,33 @@ def softmax_fwd_kernel(
 
         cute.arch.sync_threads()
 
-        partial_max = max_buffer[lidx % (threads_per_row // 32)] 
-        partial_result = reduction_buffer[lidx %  (threads_per_row // 32)] 
+        warps_per_row = threads_per_row // cute.arch.WARP_SIZE 
+        
+        # # naive addressing
+        # row_start = widx // warps_per_row * warps_per_row
+        # idx = row_start + lidx % warps_per_row
+        # partial_max = max_buffer[idx] 
+        # partial_result = reduction_buffer[idx]
 
-    # inter-warp reduction
+        # # implemented using CuTe Layouts 
+        # thr2buffer = cute.make_layout( ((warps_per_row, cute.arch.WARP_SIZE // warps_per_row),(warps_per_row, num_warps // warps_per_row)),
+        #                                  stride=((1, 0), (0, warps_per_row))) 
+        # partial_max = max_buffer[thr2buffer((lidx, widx))] # (lidx, widx) can be replaced by tidx
+        # partial_result = reduction_buffer[thr2buffer((lidx, widx))]
+        
+        # thr2buffer coalesces into ((warps_per_row, cute.arch.WARP_SIZEs, num_warps // warps_per_row):(1, 0, warps_per_row)), this layout can only be indexed into using tidx 
+        thr2buffer = cute.make_layout((warps_per_row, cute.arch.WARP_SIZE, num_warps // warps_per_row), stride=(1, 0, warps_per_row))
+        partial_max = max_buffer[thr2buffer(tidx)]
+        partial_result = reduction_buffer[thr2buffer(tidx)]
+        
+        # kept this for fun, naive addressing is clearer imo
+        
+
     full_max = warp_reduction_partial(partial_max, cute.arch.fmax, max(threads_per_row//32, 1))
     partial_result = partial_result * cute.math.exp(partial_max - full_max)
     divisor = warp_reduction_partial(partial_result, operator.add, max(threads_per_row//32, 1))
 
-
+    # compute and store result 
     for ni in cutlass.range_constexpr(0, n_iters):
         for i in cutlass.range_constexpr(vec_size):
             if rPred[i, ni]:
@@ -159,7 +179,7 @@ def softmax_fwd_builder(X: torch.Tensor) -> Callable:
     mY = from_dlpack(Y, assumed_align=16)
 
     M, N = mX.shape
-    bdim = 512 # 256, 512, 1024 all work, gives different perf for >2**16
+    bdim = 1024 # 256, 512, 1024 all work, gives different perf for >2**16
     assert N > 1
 
     max_vec_size = 128 // mX.element_type.width # 128 bits is largest ld/st instruction
@@ -196,7 +216,7 @@ def softmax_fwd_builder(X: torch.Tensor) -> Callable:
         # print(f"tiler: {tiler}")
         cX = cute.make_identity_tensor(mX.shape) 
 
-        fwd_kernel = softmax_fwd_kernel(mX, mY, cX, tv_layout, tiler, mX.shape, tiled_copy, n_iters, vec_size, threads_per_row)
+        fwd_kernel = softmax_fwd_kernel(mX, mY, cX, tv_layout, tiler, mX.shape, tiled_copy, n_iters, vec_size, threads_per_row, bdim)
         num_blocks = (cute.size(mX.shape[0]) + rows_per_block - 1) // rows_per_block
         fwd_kernel.launch(
             grid=(num_blocks, 1, 1),
@@ -337,7 +357,7 @@ def softmax_bwd_builder(Y: torch.Tensor, dY: torch.Tensor) -> Callable:
             mY.element_type,
             num_bits_per_copy=bits_per_vec
         )
-
+        assert not bdim > 1024 # some consumer cards allow > 1024, but t > 1024 would require an extra interwarp reduction
         thr_layout = cute.make_layout((bdim,), stride=(vec_size,))
         val_layout = cute.make_layout((n_iters * vec_size), stride=(1))
 
@@ -367,8 +387,7 @@ def softmax_bwd_builder(Y: torch.Tensor, dY: torch.Tensor) -> Callable:
     
     return kernel_wrapper
         
-
-
+BENCH_SIZE = 2**29
 
 def test_fwd(dims: list[int], dtype=torch.bfloat16):
     for dim in dims:
@@ -388,8 +407,8 @@ def benchmark_fwd(dims: list[int], dtype=torch.bfloat16) -> list[float]:
     
     for dim in dims:
         p = torch.cuda.get_device_properties(0)
-        M = (2**29//dim + p.multi_processor_count - 1) // p.multi_processor_count * p.multi_processor_count
-        M =  2**29//dim
+        M = (BENCH_SIZE // dim + p.multi_processor_count - 1) // p.multi_processor_count * p.multi_processor_count
+        M =  BENCH_SIZE // dim
         X = torch.randn(M, dim, device='cuda', dtype=dtype)
         Y = torch.empty_like(X)
         softmax_fwd = softmax_fwd_builder(X)
@@ -414,7 +433,7 @@ def test_bwd(dims: list[int], dtype=torch.bfloat16):
 def benchmark_bwd(dims: list[int], dtype=torch.bfloat16) -> list[float]:
     times = []
     for dim in dims:
-        Y = torch.randn(2**29//dim, dim, device='cuda', dtype=dtype)
+        Y = torch.randn(BENCH_SIZE//dim, dim, device='cuda', dtype=dtype)
         dY = torch.randn_like(Y)
         dX = torch.empty_like(Y)
         softmax_bwd = softmax_bwd_builder(Y, dY)
@@ -476,32 +495,51 @@ def benchmark(fn: Callable, inputs: Iterable[torch.Tensor] | torch.Tensor = (), 
     median_time = times[len(times) // 2]
     return median_time
 
+
+import threading, time, pynvml
+
+class MeasureMemoryClock():
+    def __init__(self, interval=0.05):
+        pynvml.nvmlInit()
+        self.handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        self.samples = []
+        self._stop = threading.Event()
+        self.interval = interval
+        
+    def sample_clk(self, interval):
+        while not self._stop.is_set():
+            self.samples.append(
+                pynvml.nvmlDeviceGetClockInfo(self.handle, pynvml.NVML_CLOCK_MEM)
+            )
+            self._stop.wait(interval)
+    
+    def __enter__(self):
+        self.thread = threading.Thread(target=self.sample_clk, args=(self.interval,), daemon=True)
+        self.thread.start()
+        return self
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._stop.set()
+        self.thread.join()
+        self.samples.sort()
+        self.median = self.samples[len(self.samples) // 2]
+
 if __name__ == "__main__":
     
     torch.manual_seed(123)
+
     test_dims = [3, 7, 8, 64, 100, 257, 1021, 2048, 2049, 4099, 8192, 32768, 131072]
     bench_dims = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
     # test_fwd(bench_dims + test_dims)
     # test_bwd(test_dims)
 
-    fwd_times = benchmark_fwd(bench_dims)
+    with MeasureMemoryClock(interval=0.01) as mem_clk:
+        fwd_times = benchmark_fwd(bench_dims)
     # bwd_times = benchmark_bwd(bench_dims)
     
 
-    def plot_bench(dims, times, n_tensors, label, dtype=torch.bfloat16):
-        p = torch.cuda.get_device_properties(0)
-        peak_gbps = p.memory_bus_width / 8 * p.memory_clock_rate * 1e3 * 2 / 1e9  # GB/s
-        import matplotlib.pyplot as plt
-        esize = torch.finfo(dtype).bits // 8
-        bw = [n_tensors * 2**29 * esize / (t*1e-3) / 1e9 for t in times]
-        plt.plot(dims, [b/peak_gbps*100 for b in bw], 'o-', label=label)
-        plt.xscale('log', base=2); plt.xlabel('N'); plt.ylabel('% of peak BW'); plt.ylim(0, 100)
-        plt.xticks(dims, [str(N) for N in dims], rotation=90, ha='right')
-        plt.legend()
-        plt.savefig(f'bench.png', dpi=150)
- 
 
-    def plot_fwd(dims, times, dtype=torch.bfloat16, *, elems=2**29, sizes=None, font='Lora', path='fwd_bench256.png'):
+
+    def plot_fwd(dims, times, dtype=torch.bfloat16, *, elems=BENCH_SIZE, sizes=None, font='Lora', path='fwd_bench.png', memory_clock=None):
         import matplotlib.pyplot as plt
         from matplotlib.ticker import FuncFormatter
 
@@ -511,7 +549,8 @@ if __name__ == "__main__":
             **(sizes or {})}
 
         p = torch.cuda.get_device_properties(0)
-        peak = p.memory_bus_width / 8 * p.memory_clock_rate * 1e3 * 2 / 1e9
+        memory_clock = p.memory_clock_rate * 1e-3 if memory_clock is None else memory_clock
+        peak = p.memory_bus_width / 8 * memory_clock * 1e6 * 2 / 1e9
 
         # empirical 1r+1w reference: a plain torch copy of the same total size
         n = elems * 2 // (torch.finfo(dtype).bits // 8)
@@ -600,14 +639,25 @@ if __name__ == "__main__":
     
     print("success")
 
-# TODO: implement warp indexing bug fix, generate plots based on locked clocks, port multiple rows per block to backwards, replace 2**29 with a global constant, split into multiple files, explore packed b16s, do a writeup
+# TODO: generate plots based on locked clocks, port multiple rows per block to backwards, split into multiple files, explore packed b16s, do a writeup
 
 # # rewrite to use layouts to organize reduction buffer
 # warp indexing bug fix 
+# widx = tidx // 32
+# lidx = tidx % 32
 # warps_per_row = threads_per_row // 32
-# row_base = (widx // warps_per_row) * warps_per_row
-# idx = row_base + lidx % warps_per_row
+# row_base = ((tidx // 32) // warps_per_row) * warps_per_row
+# idx = row_base + (tidx % 32) % warps_per_row
 # partial_max = max_buffer[idx]
 # partial_result = reduction_buffer[idx]
+
+# (wpr, 32 / wpr) : (1, 0) index using [lidx] 
+# (num_warps / wpr, wpr) : (0, 1)  index using [widx]
+# full layout = ((wpr, num_lanes / wpr), (wpr, num_warps / wpr)) : ((1, 0), (0, wpr))
+# widx 0-3
+# wpr = 2
+# widx 0, 1 -> idx 0, widx 2, 3 -> idx 1
+# (2, 2) : (0, 1)  index using [widx]
+# 
 
 # ncu --set full -f -o softmax_fwd -k regex:cutlass_softmax_fwd --launch-skip 3 --launch-count 1 uv run softmax.py
