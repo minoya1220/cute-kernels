@@ -1,4 +1,6 @@
 # reimplementation of vector add educational notebook from NVIDIA
+# source: https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/cute/notebooks/elementwise_add.ipynb
+
 import torch
 from functools import partial
 from typing import List
