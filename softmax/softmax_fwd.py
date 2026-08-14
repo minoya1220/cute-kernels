@@ -4,10 +4,21 @@ import torch
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from collections.abc import Callable
-from cutlass import Float32, Boolean
+from cutlass import Float32, Boolean, Int16
 from cutlass.cute.runtime import from_dlpack
 from math import gcd
 from utils import warp_reduction_partial
+
+
+
+from typing import Optional
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass import Float32
+
+
+
 
 
 @cute.kernel
@@ -130,16 +141,16 @@ def softmax_fwd_kernel(
         
     full_max = warp_reduction_partial(partial_max, cute.arch.fmax, max(threads_per_row//32, 1))
     partial_sum = partial_sum * cute.math.exp(partial_max - full_max)
-    divisor = warp_reduction_partial(partial_sum, operator.add, max(threads_per_row//32, 1))
+    divisor = 1.0 / warp_reduction_partial(partial_sum, operator.add, max(threads_per_row//32, 1))
 
 
-    # Compute and store result 
+    # Compute final result 
     for ni in cutlass.range_constexpr(0, n_iters):
         for i in cutlass.range_constexpr(vec_size):
-            if rPred[i, ni]:
-                tXgY[i, ni] = (cute.math.exp(tXrX[i, ni].to(Float32) - full_max) / divisor).to(tXgY.element_type)
+            tXrX[i, ni] = (cute.math.exp(tXrX[i, ni].to(Float32) - full_max) * divisor).to(tXgY.element_type)
 
-
+    # Store final result
+    cute.copy(tiled_copy, tXrX, tXgY, pred=rPred)
 
 def softmax_fwd_builder(X: torch.Tensor) -> Callable:
     assert X.is_contiguous()
@@ -149,7 +160,7 @@ def softmax_fwd_builder(X: torch.Tensor) -> Callable:
     mY = from_dlpack(Y, assumed_align=16)
 
     M, N = mX.shape
-    bdim = 1024 # 256, 512, 1024 all work, gives different perf for >2**16
+    bdim = 1024 # 256, 512, 1024 all work, 1024 ensures that the register file is fully utilized for N > 32768 
     assert N > 1
 
     max_vec_size = 128 // mX.element_type.width # 128 bits is largest ld/st instruction
@@ -198,7 +209,7 @@ def softmax_fwd_builder(X: torch.Tensor) -> Callable:
 
 
     compiled_kernel = cute.compile(softmax_fwd_launcher, mX, mY)
-    
+    print(compiled_kernel.__ptx__)
     def kernel_wrapper(X: torch.Tensor, *, out: torch.Tensor = None) -> torch.Tensor:
         original_shape = X.shape
         X = X.flatten(0,-2)
@@ -212,32 +223,28 @@ def softmax_fwd_builder(X: torch.Tensor) -> Callable:
     return kernel_wrapper
 
 
-        
 
 
 
+# @dsl_user_op
+# def cvt_bf16_f32_alt(
+#     src_bf16: ir.Value,
+#     *,
+#     loc: Optional[ir.Location] = None,
+#     ip: Optional[ir.InsertionPoint] = None,
+# ) -> Float32:
+#     v = src_bf16 if isinstance(src_bf16, ir.Value) else src_bf16.ir_value(loc=loc, ip=ip)
+#     v_i16 = llvm.bitcast(Int16.mlir_type, v, loc=loc, ip=ip)
+#     instr = "mov.b32 $0, {0, $1};"# "cvt.f32.bf16 $0, $1;"
+#     res = llvm.inline_asm(
+#         Float32.mlir_type, [v_i16],
+#         instr, "=f,h",
+#         has_side_effects=True, is_align_stack=False,
+#         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+#     )
+#     return Float32(res)
 
+ 
+# # if this isnt enough to bring perf up for larger sizes could try using SMEM as a expanded register file, could increase cache size up to ~50% <- use cp asnyc for this if attempted
 
-
-# TODO: split into multiple files, explore packed b16s, do a writeup
-
-# # rewrite to use layouts to organize reduction buffer
-# warp indexing bug fix 
-# widx = tidx // 32
-# lidx = tidx % 32
-# warps_per_row = threads_per_row // 32
-# row_base = ((tidx // 32) // warps_per_row) * warps_per_row
-# idx = row_base + (tidx % 32) % warps_per_row
-# partial_max = max_buffer[idx]
-# partial_sum = reduction_buffer[idx]
-
-# (wpr, 32 / wpr) : (1, 0) index using [lidx] 
-# (num_warps / wpr, wpr) : (0, 1)  index using [widx]
-# full layout = ((wpr, num_lanes / wpr), (wpr, num_warps / wpr)) : ((1, 0), (0, wpr))
-# widx 0-3
-# wpr = 2
-# widx 0, 1 -> idx 0, widx 2, 3 -> idx 1
-# (2, 2) : (0, 1)  index using [widx]
-# 
-
-# ncu --set full -f -o softmax_fwd -k regex:cutlass_softmax_fwd --launch-skip 3 --launch-count 5 uv run softmax.py
+# # also noticed that f32 fmax is used but there is a packed bf16 max available in ptx so coudl make op for that, wouldnt affect perf tho

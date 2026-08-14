@@ -4,38 +4,41 @@ from softmax.softmax_bwd import softmax_bwd_builder
 import matplotlib.pyplot as plt
 from measure import benchmark
 from matplotlib.ticker import FuncFormatter
+from pathlib import Path
 
 BENCH_SIZE = 2**29
 
-def test_fwd(dims: list[int], dtype=torch.bfloat16):
-    for dim in dims:
-        X = torch.randn(2**6 - 1, dim, device='cuda', dtype=dtype)
+def test_fwd(dims: list[int], dtypes=[torch.bfloat16]):#, torch.half, torch.float, torch.double]):
+    for dtype in dtypes:
+        for dim in dims:
+            X = torch.randn(2**6 - 1, dim, device='cuda', dtype=dtype)
 
-        torch_softmax = torch.softmax(X.double(), dim=1).to(X.dtype)
-        softmax_fwd = softmax_fwd_builder(X)
-        try:
-            torch.testing.assert_close(torch_softmax, softmax_fwd(X))
-            print(f"dim={dim} passed")
+            torch_softmax = torch.softmax(X.double(), dim=1).to(X.dtype)
+            softmax_fwd = softmax_fwd_builder(X)
+            try:
+                torch.testing.assert_close(torch_softmax, softmax_fwd(X))
+                print(f"fwd: dim={dim}, dtype={dtype}  passed")
 
-        except AssertionError as e:
-            print(f"dim={dim} failed")
+            except AssertionError as e:
+                print(f"fwd: dim={dim}, dtype={dtype} failed")
 
-def test_bwd(dims: list[int], dtype=torch.bfloat16):
-    for dim in dims:
-        X = torch.randn(2**6 - 1, dim, device='cuda', dtype=dtype)
-        dY = torch.randn_like(X)
-        
-        Y = torch.softmax(X, dim=1).to(dtype)
-        Y_double, dY_double = Y.double(), dY.double()
-        ref_softmax_bwd = (Y_double * (dY_double - (Y_double * dY_double).sum(dim=1, keepdim=True))).to(dtype)
+def test_bwd(dims: list[int], dtypes=[torch.bfloat16, torch.half, torch.float, torch.double]):
+    for dtype in dtypes:
+        for dim in dims:
+            X = torch.randn(2**6 - 1, dim, device='cuda', dtype=dtype)
+            dY = torch.randn_like(X)
+            
+            Y = torch.softmax(X, dim=1).to(dtype)
+            Y_double, dY_double = Y.double(), dY.double()
+            ref_softmax_bwd = (Y_double * (dY_double - (Y_double * dY_double).sum(dim=1, keepdim=True))).to(dtype)
 
-        softmax_bwd = softmax_bwd_builder(Y, dY)
-        try:
-            torch.testing.assert_close(ref_softmax_bwd, softmax_bwd(Y, dY))
-            print(f"dim={dim} passed")
+            softmax_bwd = softmax_bwd_builder(Y, dY)
+            try:
+                torch.testing.assert_close(ref_softmax_bwd, softmax_bwd(Y, dY))
+                print(f"bwd: dim={dim}, dtype={dtype} passed")
 
-        except AssertionError as e:
-            print(f"dim={dim} failed")
+            except AssertionError as e:
+                print(f"bwd: dim={dim}, dtype={dtype} failed")
 
 
 def benchmark_fwd(dims: list[int], *, dtype=torch.bfloat16, elems=BENCH_SIZE) -> list[float]:
@@ -66,18 +69,19 @@ def benchmark_bwd(dims: list[int], *, dtype=torch.bfloat16, elems=BENCH_SIZE) ->
 
 def plot_bench(dims, times, passes, title, dtype=torch.bfloat16, *,
             elems=BENCH_SIZE, reference=False, memory_clock=None,
-            color='#83a598', sizes=None, font='Lora', path=None):
+            color='#83a598', sizes=None, font='Lora', name=None):
 
     c = dict(bg='#1d2021', fg='#ebdbb2', muted='#928374', grid='#32302f',
             spine='#504945', band='#282828', line=color)
     s = {**dict(base=11.5, title=13.5, axis_label=11.5, tick=9.5, ref=9.5),
         **(sizes or {})}
+    path = Path(__file__).parent / "plots" / f"{name or title.lower().replace(' ', '_')}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     p = torch.cuda.get_device_properties(0)
     memory_clock = p.memory_clock_rate * 1e-3 if memory_clock is None else memory_clock
     peak = p.memory_bus_width / 8 * memory_clock * 1e6 * 2 / 1e9
 
-    path = path or f"{title.lower().replace(' ', '_')}.png"
 
     esize = torch.finfo(dtype).bits // 8
     gb = [passes * elems * esize / (t * 1e-3) / 1e9 for t in times]
@@ -163,15 +167,15 @@ if __name__ == "__main__":
 
     test_dims = [3, 7, 8, 64, 100, 257, 1021, 2048, 2049, 4099, 8192, 32768, 131072]
     bench_dims = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
-    test_fwd(bench_dims + test_dims)
-    test_bwd(bench_dims + test_dims)
+    # test_fwd(bench_dims + test_dims)
+    # test_bwd(bench_dims + test_dims)
 
     # with MeasureMemoryClock(interval=0.01) as mem_clk:
-    # fwd_times = benchmark_fwd(bench_dims)
-    # bwd_times = benchmark_bwd(bench_dims)
+    fwd_times = benchmark_fwd(bench_dims)
+    plot_bench(bench_dims, fwd_times, 2, 'Softmax Forward10', color='#83a598', reference=True)
     
-    # plot_bench(bench_dims, fwd_times, 2, 'Softmax Forward', color='#83a598', path='fwd_bench.png', reference=True)
-    # plot_bench(bench_dims, bwd_times, 3, 'Softmax Backward', color='#fabd2f', path='bwd_bench.png', reference=True)
+    # bwd_times = benchmark_bwd(bench_dims)
+    # plot_bench(bench_dims, bwd_times, 3, 'Softmax Backward', color='#fabd2f', reference=True)
     
     # from torch.profiler import profile, ProfilerActivity
     # with profile(
@@ -181,8 +185,12 @@ if __name__ == "__main__":
     #     benchmark_fwd([2**14])
     # prof.export_chrome_trace("trace.json")
 
-    # test_fwd([2**14])
+    # test_fwd([2**16])
 
-    # TODO: use pytest (maybe), rename repo, remove softmax pkg, fix plotting output dir, pack bf16s, do writeup, add controls to enable unoptimized versions
-    
+    # TODO: fix plotting output dir, pack bf16s, do writeup, rename repo, remove softmax pkg, add controls to enable unoptimized versions
+    # On packing -> i think we should have a path where if the width is 16 bits or less floats can get packed as bf16s (lower dtypes get upcasted to bf16 bc no inf) or halfs
     print("success")
+
+# # profiling cmd
+# ncu --set full -f -o softmax_fwd -k regex:cutlass_softmax_fwd --launch-skip 3 --launch-count 5 uv run softmax.py
+
