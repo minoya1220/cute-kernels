@@ -1,7 +1,7 @@
 [project]
-name = "cute-kernels"
+name = "gpu-kernels"
 version = "0.1.0"
-description = "A repo of kernels ive written in CuTe DSL."
+description = "A repo of GPU kernels ive written."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -16,5 +16,5 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["cute-kernels", "softmax"]
+packages = ["gpu-kernels]["softmax"]
 py-modules = ["measure", "utils"]
